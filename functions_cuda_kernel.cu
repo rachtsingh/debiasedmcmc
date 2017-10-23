@@ -94,7 +94,7 @@ __device__ void mh_kernel(float *samples, int i, curandState_t *rand_state) {
     }
 }
 
-__device__ void coupled_mh_kernel(float *x_chain, float *y_chain, float std_1, float std_2, int i) {
+__device__ void coupled_mh_kernel(float chain_x_state, float chain_y_state, float std_1, float std_2, float *ret_x, float *ret_y) {
     int addr = threadIdx.x;
     // replace with loop when parallelizing
     if (addr != 0) {
@@ -104,19 +104,19 @@ __device__ void coupled_mh_kernel(float *x_chain, float *y_chain, float std_1, f
     curandState_t *rand_state = &global_states[idx];
     float proposal_x;
     float proposal_y;
-    max_coupling_kernel(x_chain[i - 1], y_chain[i - 1], std_1, std_2, &proposal_x, &proposal_y, rand_state);
+    max_coupling_kernel(chain_x_state, chain_y_state, std_1, std_2, &proposal_x, &proposal_y, rand_state);
     double p_pdf_x = log_norm_pdf(proposal_x, 0., 1.);
     double p_pdf_y = log_norm_pdf(proposal_y, 0., 1.);
-    double s_pdf_x = log_norm_pdf(x_chain[i - 1], 0., 1.);
-    double s_pdf_y = log_norm_pdf(y_chain[i - 1], 0., 1.);
+    double s_pdf_x = log_norm_pdf(chain_x_state, 0., 1.);
+    double s_pdf_y = log_norm_pdf(chain_y_state, 0., 1.);
     double coin = log(curand_uniform(rand_state));
-    x_chain[i] = x_chain[i - 1];
-    y_chain[i] = y_chain[i - 1];
+    *ret_x = chain_x_state;
+    *ret_y = chain_y_state;
     if (coin < (p_pdf_x - s_pdf_x)) {
-        x_chain[i] = proposal_x;
+        *ret_x = proposal_x;
     } 
     if (coin < (p_pdf_y - s_pdf_y)) {
-        y_chain[i] = proposal_y;
+        *ret_y = proposal_y;
     }
 }
 
@@ -133,12 +133,66 @@ __global__ void run_mh_chain(float *samples, int length) {
     }
 }
 
+// samples is a preallocated chain of [max_iterations] floats
+__global__ void run_mh_coupled_chain(float *samples, int length, int pitch, int max_iterations, int K=1) {
+    int addr = threadIdx.x;
+    // replace with loop when parallelizing
+    if (addr != 0) {
+        return;
+    }
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    curandState_t *rand_state = &global_states[idx];
+    
+    // calculate the positions of the two blocks that we care about
+    float *x_chain = (float *) ((char *) samples);
+    float *y_chain = (float *) ((char *) samples + pitch);
+
+    // we can allow passing this in, hard coded for now
+    x_chain[0] = (curand_normal(rand_state) * 0.1) + 0.4;
+    y_chain[0] = (curand_normal(rand_state) * 0.9) - 0.8;
+
+    // sample the x from the marginal kernel
+    mh_kernel(x_chain, 1, rand_state);
+
+    int meeting_time = max_iterations + 1;
+    bool met = false;
+  
+    for (int i = 1; i < max_iterations - 1; i++) {
+        if (met) {
+            mh_kernel(x_chain, i + 1, rand_state);
+            y_chain[i] = x_chain[i + 1];
+        }
+        else {
+            coupled_mh_kernel(x_chain[i], y_chain[i - 1], 0.2, 0.3, &x_chain[i + 1], &y_chain[i]);
+            if (!met && (x_chain[i + 1] == y_chain[i])) {
+                met = true;
+                meeting_time = i;
+            }
+        }
+        if (i >= max(meeting_time, K)) {
+            break;
+        }
+    }
+    printf("meeting_time: %d, (%f, %f)", meeting_time, x_chain[meeting_time + 1], y_chain[meeting_time]);
+}
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 int run_mh_with_kernel(float *samples, int length) {
     run_mh_chain<<<1, NUM_BLOCKS>>>(samples, length);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("error in mh_kernel: %s\n", cudaGetErrorString(err));
+        return 2;
+    }
+    return 0;
+}
+
+int run_mh_with_coupled_kernel(float *samples, int length, int pitch) {
+    run_mh_coupled_chain<<<1, NUM_BLOCKS>>>(samples, length, pitch, length, 100);
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
