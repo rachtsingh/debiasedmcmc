@@ -14,7 +14,7 @@ float run_init(void) {
     return init_distribution(generator);
 }
 
-// we'll ignore num_chains for now
+// this is confirmed as working
 void run_chain(int length, int num_chains) {
     float *samples;
     int err = cudaMalloc(&samples, length * sizeof(float));
@@ -50,7 +50,32 @@ void run_chain(int length, int num_chains) {
     delete[] local_samples;
 }
 
+// this is confirmed as working
+void sample_from_coupling(const int length, int num_chains) {
+    float *samples;
+    size_t pitch;
+    int err = cudaMallocPitch(&samples, &pitch, length * sizeof(float), 2);
+    if (err) {
+        cout << "cudaMalloc failed;" << endl;
+    }
+    
+    // run the CUDA sampler
+    err = run_mh_coupling_sampler(samples, length, pitch);
+    if (err) {
+        cout << "mh_with_kernel failed" << endl;
+    }
+
+    float local_samples[2][length];
+    cudaMemcpy2D(local_samples, length * sizeof(float), samples, pitch, length * sizeof(float), 2, cudaMemcpyDeviceToHost);
+
+    for (int i = 0;  i < length; i++) {
+        cout << local_samples[0][i] << ',' << local_samples[1][i] << endl;
+    }
+
+    cudaFree(samples);
+}
+
 int main (void) {
     init_rand();
-    run_chain(10000, 1);
+    sample_from_coupling(10000, 1);
 }

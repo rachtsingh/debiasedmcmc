@@ -5,6 +5,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 
+#include <utility>
+
 /* we need these includes for CUDA's random number stuff */
 #include <curand.h>
 #include <curand_kernel.h>
@@ -37,30 +39,97 @@ __global__ void sample_gamma_dbl_kernel(int height, int width, double *a_data, d
   }
 }
 
-__device__ double log_target(double x) {
-    // -0.5 log(2pi) - log(1)
-    return -0.91893853320467267 + 0 - 0.5 * (x * x);
+__device__ double log_norm_pdf(double x, double mu, double sigma) {
+    // -0.5 log(2pi) hardcoded
+    return -0.91893853320467267 - log(sigma) - 0.5 * ((x - mu) * (x - mu)) / (sigma * sigma);
 }
 
-__global__ void mh_kernel(float *samples, int length) {
+__device__ void max_coupling_kernel(float mu1, float mu2, float sigma1, float sigma2, float *x_out, float *y_out, curandState_t *rand_state) {
+    float x = mu1 + (curand_normal(rand_state) * sigma1);
+    float coin = log(curand_uniform(rand_state));
+    if (log_norm_pdf(x, mu1, sigma1) + coin < log_norm_pdf(x, mu2, sigma2)) {
+        *x_out = x;
+        *y_out = x;
+    }
+    else {
+        float y = 0;
+        do {
+            y = mu2 + (curand_normal(rand_state) * sigma2); 
+            coin = log(curand_uniform(rand_state));
+        } while (log_norm_pdf(y, mu2, sigma2) + coin < log_norm_pdf(y, mu1, sigma1));
+        *x_out = x;
+        *y_out = y;
+    }
+}
+
+// we can run this function in parallel, but for now let's do the slow thing, to test
+__global__ void sample_from_max_coupling(float *samples, int length, int pitch, float mu1, float mu2, float sigma1, float sigma2) {
     int addr = threadIdx.x;
-    // replace with loop
+    // replace with loop when parallelizing
+    if (addr != 0) {
+        return;
+    }
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    curandState_t *rand_state = &global_states[idx];
+    
+    // calculate the positions of the two blocks that we care about
+    float *x_chain = (float *) ((char *) samples);
+    float *y_chain = (float *) ((char *) samples + pitch);
+  
+    for (int i = 0; i < length; i++) {
+        max_coupling_kernel(mu1, mu2, sigma1, sigma2, &x_chain[i], &y_chain[i], rand_state);
+    }
+}
+
+__device__ void mh_kernel(float *samples, int i, curandState_t *rand_state) {
+    float proposal = curand_normal(rand_state) + samples[i - 1];
+    double p_pdf = log_norm_pdf(proposal, 0., 1.);
+    double s_pdf = log_norm_pdf(samples[i - 1], 0., 1.);
+    double coin = log(curand_uniform(rand_state));
+    if (coin < (p_pdf - s_pdf)) {
+        samples[i] = proposal;
+    }
+    else {
+        samples[i] = samples[i - 1];
+    }
+}
+
+__device__ void coupled_mh_kernel(float *x_chain, float *y_chain, float std_1, float std_2, int i) {
+    int addr = threadIdx.x;
+    // replace with loop when parallelizing
+    if (addr != 0) {
+        return;
+    }
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    curandState_t *rand_state = &global_states[idx];
+    float proposal_x;
+    float proposal_y;
+    max_coupling_kernel(x_chain[i - 1], y_chain[i - 1], std_1, std_2, &proposal_x, &proposal_y, rand_state);
+    double p_pdf_x = log_norm_pdf(proposal_x, 0., 1.);
+    double p_pdf_y = log_norm_pdf(proposal_y, 0., 1.);
+    double s_pdf_x = log_norm_pdf(x_chain[i - 1], 0., 1.);
+    double s_pdf_y = log_norm_pdf(y_chain[i - 1], 0., 1.);
+    double coin = log(curand_uniform(rand_state));
+    x_chain[i] = x_chain[i - 1];
+    y_chain[i] = y_chain[i - 1];
+    if (coin < (p_pdf_x - s_pdf_x)) {
+        x_chain[i] = proposal_x;
+    } 
+    if (coin < (p_pdf_y - s_pdf_y)) {
+        y_chain[i] = proposal_y;
+    }
+}
+
+__global__ void run_mh_chain(float *samples, int length) {
+    int addr = threadIdx.x;
+    // replace with loop when parallelizing
     if (addr != 0) {
         return;
     }
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
     curandState_t *rand_state = &global_states[idx];
     for (int i = 1; i < length; i++) {
-        float proposal = curand_normal(rand_state) + samples[i - 1];
-        double p_pdf = log_target(proposal);
-        double s_pdf = log_target(samples[i - 1]);
-        double coin = log(curand_uniform(rand_state));
-        if (coin < (p_pdf - s_pdf)) {
-            samples[i] = proposal;
-        }
-        else {
-            samples[i] = samples[i - 1];
-        }
+        mh_kernel(samples, i, rand_state);
     }
 }
 
@@ -69,7 +138,18 @@ extern "C" {
 #endif
 
 int run_mh_with_kernel(float *samples, int length) {
-    mh_kernel<<<1, NUM_BLOCKS>>>(samples, length);
+    run_mh_chain<<<1, NUM_BLOCKS>>>(samples, length);
+    cudaDeviceSynchronize();
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("error in mh_kernel: %s\n", cudaGetErrorString(err));
+        return 2;
+    }
+    return 0;
+}
+
+int run_mh_coupling_sampler(float *samples, int length, int pitch) {
+    sample_from_max_coupling<<<1, NUM_BLOCKS>>>(samples, length, pitch, 0.2, 0.8, 0.4, 1.7);
     cudaDeviceSynchronize();
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
