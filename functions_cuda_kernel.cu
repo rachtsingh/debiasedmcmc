@@ -147,9 +147,9 @@ __global__ void run_mh_coupled_chain(float *samples, int length, int pitch, int 
     float *x_chain = (float *) ((char *) samples);
     float *y_chain = (float *) ((char *) samples + pitch);
 
-    // we can allow passing this in, hard coded for now
+    // we can allow passing this in, hard coded for now - it's definitely good
     x_chain[0] = (curand_normal(rand_state) * 0.1) + 0.4;
-    y_chain[0] = (curand_normal(rand_state) * 0.9) - 0.8;
+    y_chain[0] = (curand_normal(rand_state) * 0.1) + 0.4;
 
     // sample the x from the marginal kernel
     mh_kernel(x_chain, 1, rand_state);
@@ -173,7 +173,8 @@ __global__ void run_mh_coupled_chain(float *samples, int length, int pitch, int 
             break;
         }
     }
-    printf("meeting_time: %d, (%f, %f)", meeting_time, x_chain[meeting_time + 1], y_chain[meeting_time]);
+    printf("met at meeting time: %d\n", (x_chain[meeting_time + 1] == y_chain[meeting_time]));
+    printf("meeting_time: %d, (%f, %f)\n", meeting_time, x_chain[meeting_time + 1], y_chain[meeting_time]);
 }
 
 #ifdef __cplusplus

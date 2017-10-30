@@ -75,6 +75,7 @@ void sample_from_coupling(const int length, int num_chains) {
     cudaFree(samples);
 }
 
+// looks like this works as well
 void run_coupled_chains(const int length, int num_chains) {
     float *samples;
     size_t pitch;
@@ -101,5 +102,5 @@ void run_coupled_chains(const int length, int num_chains) {
 
 int main (void) {
     init_rand();
-    run_coupled_chains(10000, 1);
+    run_coupled_chains(500, 1);
 }
